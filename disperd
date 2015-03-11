@@ -1,0 +1,173 @@
+#!/usr/bin/python
+# Copyright (C) 2015 Peter Hatina <phatina@gmail.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <http://www.gnu.org/licenses/>.
+
+
+import logging
+import os
+import time
+import sys
+
+from xcb.xproto import *
+
+# Python path hack copied from disper
+sys.path.append('/usr/lib/python2.7/site-packages/disper')
+import disper
+
+import xcb
+import xcb.randr
+
+
+logging.basicConfig(
+    format='%(asctime)s %(levelname)s: %(message)s',
+    datefmt='%Y.%m.%d %H:%M:%S')
+
+
+
+class DisperDaemon(object):
+    '''
+    Disper daemon listening for XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE and
+    performing display switches.
+    '''
+    def __init__(self):
+        self.logger = logging.getLogger('DisperDaemon')
+        self.logger.setLevel(logging.DEBUG)
+        self.conn = xcb.connect()
+        self.root = self.conn.get_setup().roots[0]
+
+        self.randr = self.conn(xcb.randr.key)
+        self.randr.SelectInput(self.root.root, xcb.randr.NotifyMask.ScreenChange)
+
+        self.conn.flush()
+
+        # Disper switcher
+        self.switcher = disper.Disper()
+        self.switcher.options_parse() # Default options
+
+        # Used monitor: MON_PRIMARY or MON_SECONDARY
+        self.displays = self.get_displays()
+
+
+    def cleanup(self):
+        self.conn.disconnect()
+
+
+    def run(self):
+        '''
+        Listen for XCB_RANDR_SCREEN_CHANGE_NOTIFY and perform necessary action.
+        '''
+        self.logger.info('Disper daemon running...')
+        current_timestamp = 0
+        connected = False
+
+        while True:
+            try:
+                time.sleep(1)
+                event = self.conn.poll_for_event()
+            except xcb.ProtocolException, error:
+                self.logger.error('Protocol error %s received!' % error.__class__.__name__)
+                break
+            except Exception as e:
+                self.logger.error('Unexpected error received:', str(e))
+                break
+            except KeyboardInterrupt as e:
+                break
+
+            # Once the ScreenChangeNotify event arrives, filter down to the one
+            # we care about.
+            if isinstance(event, xcb.randr.ScreenChangeNotifyEvent):
+                # 3 consecutive events arrive with the same timestamp
+                if current_timestamp != event.config_timestamp:
+                    current_timestamp = event.config_timestamp
+                    self.process_event(event)
+
+        self.logger.info('Disper daemon stopped')
+
+
+    def process_event(self, event):
+        '''
+        Performs an action for an event.
+
+        Args:
+            event: xcb.randr.ScreenChangeNotifyEvent
+        '''
+        displays = self.get_displays()
+
+        self.logger.debug('Displays: %s', str(displays))
+        if len(displays) == 1:
+            self.logger.debug('  Switching to primary monitor')
+            self.switch_primary()
+        else:
+            # TODO: What if more than 2 displays are attached?
+            new_display = self.get_new_displays(displays)[0]
+            if new_display:
+                self.logger.debug('  Switching to %s' % new_display)
+                self.switch(new_display)
+
+        self.displays = displays
+
+
+    def get_displays(self):
+        '''
+        Returns a list of string with display names.
+        '''
+        sw = self.switcher.switcher()
+
+        # Erase cached value from Switcher
+        sw._displays = None
+
+        # Recreate backend to reload the display's count
+        backend_cls = sw.backend.__class__
+        del sw.backend
+        sw.backend = backend_cls()
+        return sw.get_displays()
+
+
+    def get_new_displays(self, displays):
+        '''
+        Returns a list of displays which aren't in self.displays.
+
+        Args:
+            displays (list):
+                List of displays to difference with self.displays
+        '''
+        d1 = set(self.displays)
+        d2 = set(displays)
+
+        if len(d2) < len(d1):
+            d1, d2 = d2, d1
+
+        return list(d2 - d1)
+
+
+    def switch(self, display):
+        '''
+        Switches display output to 'display'.
+
+        Args:
+            display (str):
+                Display to switch to
+        '''
+        self.switcher.switch_single(display)
+
+
+    def switch_primary(self):
+        self.switcher.switch_primary()
+
+
+if __name__ == '__main__':
+    daemon = DisperDaemon()
+    daemon.run()
+    daemon.cleanup()
