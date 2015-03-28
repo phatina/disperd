@@ -15,10 +15,19 @@
 # along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 
+import argparse
+import dbus
+import gobject
 import logging
+import multiprocessing
 import os
 import time
 import sys
+
+try:
+    from ConfigParser import ConfigParser, RawConfigParser
+except ImportError:
+    from configparser import ConfigParser, RawConfigParser
 
 from xcb.xproto import *
 
@@ -29,95 +38,189 @@ import disper
 import xcb
 import xcb.randr
 
+from dbus.mainloop.glib import DBusGMainLoop
+
 
 logging.basicConfig(
     format='%(asctime)s %(levelname)s: %(message)s',
     datefmt='%Y.%m.%d %H:%M:%S')
 
 
+HOMEDIR = os.path.expanduser('~')
 
-class DisperDaemon(object):
+
+class Autostart(object):
     '''
-    Disper daemon listening for XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE and
-    performing display switches.
+    Helper class for autostart desktop file management.
+    '''
+    DESKTOP_FILE = os.path.join(HOMEDIR, '.config/autostart/disperd.desktop')
+
+    @staticmethod
+    def enable():
+        '''
+        Enables daemon autostart.
+        '''
+        fout = open(Autostart.DESKTOP_FILE, 'w')
+
+        fout.write(
+            '[Desktop Entry]\n'
+            'Name=disperd\n'
+            'GenericName=Display hotplug switcher\n'
+            'Comment=Switch display output on monitor hotplug\n'
+            'Exec=%s\n'
+            'Terminal=False\n'
+            'Type=Application\n'
+            'StartupNotify=false\n' %
+                os.path.realpath(
+                    os.path.join(
+                        os.path.curdir, sys.argv[0])))
+
+        fout.close()
+
+    @staticmethod
+    def disable():
+        '''
+        Disables daemon autostart.
+        '''
+        if not os.path.exists(Autostart.DESKTOP_FILE):
+            return
+
+        os.remove(Autostart.DESKTOP_FILE)
+
+
+class Config(object):
+    '''
+    Disperd configuration parser.
+    '''
+    CONFIG_FILE = os.path.join(HOMEDIR, '.config/disperd.conf')
+
+    SECTION_GENERAL = 'General'
+    OPTION_ACTION = 'action'
+    OPTION_ACTION_VALUES = ['switch', 'extend'] # TODO: clone
+    OPTION_EXTEND_DIRECTION = 'extend_direction'
+
+    def __init__(self, config_file=None):
+        if config_file is None:
+            config_file = self.CONFIG_FILE
+        self.config_file = config_file
+
+        if not os.path.exists(self.config_file):
+            self.write_default_config(self.config_file)
+
+        config = ConfigParser()
+        config.read(self.config_file)
+
+        self.action = config.get(self.SECTION_GENERAL, self.OPTION_ACTION)
+        self.extend_direction = config.get(self.SECTION_GENERAL, self.OPTION_EXTEND_DIRECTION)
+
+    def write_default_config(self, config_file):
+        '''
+        Writes a default configuration file.
+
+        Args:
+            config_file (str)
+                Path to configuratio file
+        '''
+        config = RawConfigParser()
+
+        config.add_section(self.SECTION_GENERAL)
+        config.set(self.SECTION_GENERAL, self.OPTION_ACTION, 'switch')
+        config.set(self.SECTION_GENERAL, self.OPTION_EXTEND_DIRECTION, 'right')
+
+        with open(self.config_file, 'w') as configfile:
+            config.write(configfile)
+
+
+class Options(object):
+    '''
+    Disperd options.
     '''
     def __init__(self):
-        self.logger = logging.getLogger('DisperDaemon')
-        self.logger.setLevel(logging.DEBUG)
-        self.conn = xcb.connect()
-        self.root = self.conn.get_setup().roots[0]
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            '-c', '--config',
+            dest='config',
+            help='Custom configuration file')
+        parser.add_argument(
+            '--enable-autostart',
+            dest='enable_autostart',
+            action='store_true',
+            default=False,
+            help='Autostart the daemon when logged in')
+        parser.add_argument(
+            '--disable-autostart',
+            dest='disable_autostart',
+            action='store_true',
+            default=False,
+            help='Disable daemon autostart when logged in')
+        self.args = parser.parse_args()
 
-        self.randr = self.conn(xcb.randr.key)
-        self.randr.SelectInput(self.root.root, xcb.randr.NotifyMask.ScreenChange)
+    def __getattr__(self, name):
+        return getattr(self.args, name)
+
+
+class XCBConnection(object):
+    '''
+    X11 connection.
+    '''
+    def __init__(self):
+        self.conn = xcb.connect()
+
+        randr = self.conn(xcb.randr.key)
+        randr.SelectInput(self.root, xcb.randr.NotifyMask.ScreenChange)
 
         self.conn.flush()
+
+    def disconnect(self):
+        '''
+        Disconnects from X.
+        '''
+        self.conn.disconnect()
+        self.conn = None
+
+    def poll_for_event(self):
+        '''
+        Polls for an X11 event.
+        '''
+        return self.conn.poll_for_event()
+
+    def wait_for_event(self):
+        '''
+        Waits for X11 event.
+
+        This function blocks until the event arrives.
+        '''
+        return self.conn.wait_for_event()
+
+    @property
+    def root(self):
+        if self.conn is None:
+            return None
+        return self.conn.get_setup().roots[0].root
+
+
+class Randr(object):
+    '''
+    Randr client.
+    '''
+    def __init__(self):
+        # XCB Connection
+        self.xcb_connection = XCBConnection()
 
         # Disper switcher
         self.switcher = disper.Disper()
         self.switcher.options_parse() # Default options
 
-        # Used monitor: MON_PRIMARY or MON_SECONDARY
+        # Current set of monitors.
         self.displays = self.get_displays()
 
-
     def cleanup(self):
-        self.conn.disconnect()
-
-
-    def run(self):
         '''
-        Listen for XCB_RANDR_SCREEN_CHANGE_NOTIFY and perform necessary action.
+        Performs a cleanup routine.
+
+        Disconnects from X.
         '''
-        self.logger.info('Disper daemon running...')
-        current_timestamp = 0
-        connected = False
-
-        while True:
-            try:
-                time.sleep(1)
-                event = self.conn.poll_for_event()
-            except xcb.ProtocolException, error:
-                self.logger.error('Protocol error %s received!' % error.__class__.__name__)
-                break
-            except Exception as e:
-                self.logger.error('Unexpected error received:', str(e))
-                break
-            except KeyboardInterrupt as e:
-                break
-
-            # Once the ScreenChangeNotify event arrives, filter down to the one
-            # we care about.
-            if isinstance(event, xcb.randr.ScreenChangeNotifyEvent):
-                # 3 consecutive events arrive with the same timestamp
-                if current_timestamp != event.config_timestamp:
-                    current_timestamp = event.config_timestamp
-                    self.process_event(event)
-
-        self.logger.info('Disper daemon stopped')
-
-
-    def process_event(self, event):
-        '''
-        Performs an action for an event.
-
-        Args:
-            event: xcb.randr.ScreenChangeNotifyEvent
-        '''
-        displays = self.get_displays()
-
-        self.logger.debug('Displays: %s', str(displays))
-        if len(displays) == 1:
-            self.logger.debug('  Switching to primary monitor')
-            self.switch_primary()
-        else:
-            # TODO: What if more than 2 displays are attached?
-            new_display = self.get_new_displays(displays)[0]
-            if new_display:
-                self.logger.debug('  Switching to %s' % new_display)
-                self.switch(new_display)
-
-        self.displays = displays
-
+        self.xcb_connection.disconnect()
 
     def get_displays(self):
         '''
@@ -134,6 +237,15 @@ class DisperDaemon(object):
         sw.backend = backend_cls()
         return sw.get_displays()
 
+    def set_displays(self, displays):
+        '''
+        Updates a list of displays.
+
+        Args:
+            displays (list)
+                List of display names
+        '''
+        self.displays = displays
 
     def get_new_displays(self, displays):
         '''
@@ -146,11 +258,25 @@ class DisperDaemon(object):
         d1 = set(self.displays)
         d2 = set(displays)
 
+        # XXX: Do we want to know, if a new display was added.
         if len(d2) < len(d1):
             d1, d2 = d2, d1
 
         return list(d2 - d1)
 
+    def poll_for_event(self):
+        '''
+        Polls for an X11 event.
+        '''
+        return self.xcb_connection.poll_for_event()
+
+    def wait_for_event(self):
+        '''
+        Waits for X11 event.
+
+        This function blocks until the event arrives.
+        '''
+        return self.xcb_connection.wait_for_event()
 
     def switch(self, display):
         '''
@@ -162,12 +288,189 @@ class DisperDaemon(object):
         '''
         self.switcher.switch_single(display)
 
-
     def switch_primary(self):
+        '''
+        Switches to primary display.
+        '''
         self.switcher.switch_primary()
+
+    def switch_extend(self, displays=None, direction=None):
+        '''
+        Extends current display setup.
+
+        Args:
+            displays (list)
+                List of displays to configure/extend
+            direction (str)
+                Direction of extension
+        '''
+        self.switcher.switch_extend(displays, direction)
+
+
+class DisperDaemon(object):
+    '''
+    Disper daemon listening for XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE event and
+    PrepareForSleep signal; and also performing display switches.
+    '''
+    def __init__(self, config=None):
+        # Configure the daemon logger.
+        self.logger = logging.getLogger('DisperDaemon')
+        self.logger.setLevel(logging.DEBUG)
+
+        # Read the configuration file.
+        self.config = Config(config)
+
+        # Randr client.
+        self.randr = Randr()
+
+        # D-Bus setup for PrepareForSleep signals.
+        DBusGMainLoop(set_as_default=True)
+        bus = dbus.SystemBus()
+
+        if bus:
+            bus.add_signal_receiver(
+                self.on_login1_prepare_for_sleep,
+                signal_name='PrepareForSleep',
+                dbus_interface='org.freedesktop.login1.Manager',
+                bus_name='org.freedesktop.login1')
+
+            # D-Bus worker.
+            self.p_dbus = multiprocessing.Process(target=self.run_dbus)
+        else:
+            self.p_dbus = None
+
+        # X11 worker.
+        self.p_xcb = multiprocessing.Process(target=self.run_xcb)
+
+    def on_login1_prepare_for_sleep(self, sleep):
+        '''
+        D-Bus handler for signal 'PrepareForSleep'
+
+        Args:
+            sleep (bool)
+                if True, the machine is going to sleep;
+                if False, the machine is about to resume
+        '''
+        if sleep:
+            # We are going to sleep; nothing interesting here.
+            return
+
+        # Trigger display switch action.
+        self.trigger_action()
+
+    def start(self):
+        '''
+        Starts the daemon.
+        '''
+        self.logger.info('Disper daemon started')
+
+        self.p_xcb.start()
+        if self.p_dbus is not None:
+            self.p_dbus.start()
+
+    def stop(self):
+        '''
+        Stops the daemon.
+        '''
+        self.p_xcb.terminate()
+        if self.p_dbus is not None:
+            self.p_dbus.join()
+        self.logger.info('Disper daemon stopped')
+
+    def run_xcb(self):
+        '''
+        Routine for X11 listener.
+        '''
+        current_timestamp = 0
+        connected = False
+
+        while True:
+            try:
+                event = self.randr.wait_for_event()
+            except xcb.ProtocolException as error:
+                self.logger.error('Protocol error %s received!' % error.__class__.__name__)
+                break
+            except Exception as e:
+                self.logger.error('Unexpected error received: %s' % str(e))
+                break
+            except KeyboardInterrupt:
+                break
+
+            # Once the ScreenChangeNotify event arrives, filter down to the one
+            # we care about.
+            if isinstance(event, xcb.randr.ScreenChangeNotifyEvent):
+                # 3 consecutive events arrive with the same timestamp
+                if current_timestamp != event.config_timestamp:
+                    current_timestamp = event.config_timestamp
+
+                    self.trigger_action()
+
+    def run_dbus(self):
+        '''
+        Routine for D-Bus listener.
+        '''
+        try:
+            loop = gobject.MainLoop()
+            loop.run()
+        except KeyboardInterrupt:
+            pass
+
+    def cleanup(self):
+        '''
+        Disconnects from X11.
+        '''
+        self.randr.cleanup()
+
+    def trigger_action(self):
+        '''
+        Performs an action for a display (dis)connection event.
+        '''
+        # Get new displays.
+        displays = self.randr.get_displays()
+
+        self.logger.debug('Connected displays: %s', ', '.join(displays))
+        if len(displays) == 1:
+            self.logger.debug('  Switching to primary display')
+            self.randr.switch_primary()
+        elif len(displays) == 2:
+            if self.config.action == 'switch':
+                try:
+                    new_display = self.randr.get_new_displays(displays)[0]
+                except IndexError:
+                    # Nothing to do here.
+                    return
+
+                self.logger.debug('  Switching to %s' % new_display)
+                self.randr.switch(new_display)
+            elif self.config.action == 'extend':
+                self.logger.debug('  Extending to %s' % new_display)
+                self.randr.switch_extend(displays, self.config.extend_direction)
+            else:
+                self.logger.error('  Unknown action: %s' % self.config.action)
+        else:
+            self.logger.error('Can\'t configure more than 2 displays.')
+
+        # Update current display list.
+        self.randr.set_displays(displays)
 
 
 if __name__ == '__main__':
-    daemon = DisperDaemon()
-    daemon.run()
+    options = Options()
+    if options.enable_autostart:
+        Autostart.enable()
+        sys.exit(0)
+    elif options.disable_autostart:
+        Autostart.disable()
+        sys.exit(0)
+
+    daemon = DisperDaemon(options.config)
+
+    daemon.start()
+
+    try:
+        while True:
+            time.sleep(64)
+    except KeyboardInterrupt:
+        daemon.stop()
+
     daemon.cleanup()

@@ -16,3 +16,5 @@
 
 * when an invalid display is specified using -d, a cryptic exception may be thrown
 
+* disperd
+  - timestamp with hotplug change - not both workers trigger an action
