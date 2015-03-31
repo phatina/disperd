@@ -41,7 +41,9 @@ disper_dirs = [
 if disper_dirs:
     sys.path.extend(disper_dirs)
 else:
-    sys.path.append(os.path.join(os.getcwd(), 'src'))
+    sys.path.append(
+        os.path.join(
+            os.path.dirname(__file__), 'src'))
 
 import disper
 
