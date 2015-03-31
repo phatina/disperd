@@ -1,5 +1,29 @@
+Disperd
+=======
+
+Disperd is an automatic switching daemon based on disper; it switches the
+output on monitor hotplug.
+
+Configuration
+-------------
+
+Behavior is based upon its configuration file stored at `~/.config/disperd.conf`.
+Example of such file:
+
+    [General]
+    action = switch
+    extend_direction = right
+
+Possible actions performed when a hotplug event occurs:
+
+  1. switch
+  2. extend
+
+Extension directions are taken from disper utility.
+
+
 Disper
-------
+======
 
 Disper is an on-the-fly display switch utility. It is intended to be used just
 before giving a presentation with a laptop, when all one wants is that the
@@ -21,13 +45,14 @@ or beamer connected, you'll get your laptop's full resolution; when an external
 display is present, it switches to clone mode after the keypress (or extend, if
 you configured it that way).
 
-In the future a graphical user interface may be added. For now I hope that it'll
-save you some time at the beginning of presentations.
 
-The initial development of this program was supported Frans and Linda
-Reijnhoudt. A big thanks to them!
+Original Project
+================
+
+This project is based on:
 
 http://willem.engen.nl/projects/disper/
 
 - Willem van Engen <dev-disper@willem.engen.nl>
 
+Many thanks.
