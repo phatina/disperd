@@ -22,6 +22,7 @@ import logging
 import multiprocessing
 import os
 import time
+import site
 import sys
 
 try:
@@ -31,8 +32,17 @@ except ImportError:
 
 from xcb.xproto import *
 
-# Python path hack copied from disper
-sys.path.append('/usr/lib/python2.7/site-packages/disper')
+# Python path hack due to disper package
+disper_dirs = [
+    os.path.join(sitepackages, 'disper')
+    for sitepackages in site.getsitepackages()
+    if os.path.exists(os.path.join(sitepackages, 'disper'))]
+
+if disper_dirs:
+    sys.path.extend(disper_dirs)
+else:
+    sys.path.append(os.path.join(os.getcwd(), 'src'))
+
 import disper
 
 import xcb
