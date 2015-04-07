@@ -61,6 +61,13 @@ logging.basicConfig(
 HOMEDIR = os.path.expanduser('~')
 
 
+def get_current_time():
+    '''
+    Returns current time rounded to int.
+    '''
+    return int(round(time.time()))
+
+
 class Autostart(object):
     '''
     Helper class for autostart desktop file management.
@@ -354,6 +361,15 @@ class DisperDaemon(object):
         # X11 worker.
         self.p_xcb = multiprocessing.Process(target=self.run_xcb)
 
+        # Time guard.
+        self.last_event_time = multiprocessing.Value(
+            'i',
+            get_current_time(),
+            lock=multiprocessing.Lock())
+
+        # Mutex for time guard.
+        self.mutex = multiprocessing.Lock()
+
     def on_login1_prepare_for_sleep(self, sleep):
         '''
         D-Bus handler for signal 'PrepareForSleep'
@@ -437,12 +453,27 @@ class DisperDaemon(object):
         '''
         Performs an action for a display (dis)connection event.
         '''
+        # Lock the mutex.
+        self.mutex.acquire()
+
+        current_time = get_current_time()
+        diff = int(round(abs(self.last_event_time.value - current_time)))
+
+        # XXX: Is 1 second enough?
+        if diff < 1:
+            # Display switch event came too soon, we don't want to perform
+            # the same action triggered by every worker.
+            self.last_event_time.value = get_current_time()
+            self.logger.debug('Trigger event came too soon...')
+            self.mutex.release()
+            return
+
         # Get new displays.
         displays = self.randr.get_displays()
 
-        self.logger.debug('Connected displays: %s', ', '.join(displays))
+        self.logger.debug('Connected displays: %s (pid: %d)' % (', '.join(displays), os.getpid()))
         if len(displays) == 1:
-            self.logger.debug('  Switching to primary display')
+            self.logger.debug('  Switching to primary display (pid: %d)' % os.getpid())
             self.randr.switch_primary()
         elif len(displays) == 2:
             if self.config.action == 'switch':
@@ -452,18 +483,24 @@ class DisperDaemon(object):
                     # Nothing to do here.
                     return
 
-                self.logger.debug('  Switching to %s' % new_display)
+                self.logger.debug('  Switching to %s (pid: %d)' % (new_display, os.getpid()))
                 self.randr.switch(new_display)
             elif self.config.action == 'extend':
-                self.logger.debug('  Extending to %s' % new_display)
+                self.logger.debug('  Extending to %s (pid: %d)' % (new_display, os.getpid()))
                 self.randr.switch_extend(displays, self.config.extend_direction)
             else:
-                self.logger.error('  Unknown action: %s' % self.config.action)
+                self.logger.error('  Unknown action: %s (pid: %d)' % (self.config.action, os.getpid()))
         else:
             self.logger.error('Can\'t configure more than 2 displays.')
 
         # Update current display list.
         self.randr.set_displays(displays)
+
+        # Update current event time.
+        self.last_event_time.value = get_current_time()
+
+        # Unlock the mutex.
+        self.mutex.release()
 
 
 if __name__ == '__main__':
